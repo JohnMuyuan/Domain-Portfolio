@@ -33,7 +33,14 @@ http://127.0.0.1:8099
 
 ## 一键部署
 
-在 Linux 服务器里，进入本项目目录后执行：
+在 Linux 服务器执行：
+
+```bash
+curl -fLsS https://raw.githubusercontent.com/JohnMuyuan/Domain-Portfolio/main/install.sh -o install.sh
+sudo sh install.sh
+```
+
+已经下载项目源码时，也可以进入项目目录后执行：
 
 ```bash
 sudo sh install.sh

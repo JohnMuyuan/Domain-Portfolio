@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-REPO_RAW="${DM_REPO_RAW:-https://raw.githubusercontent.com/JohnMuyuan/domain-manager/main}"
+REPO_RAW="${DM_REPO_RAW:-https://raw.githubusercontent.com/JohnMuyuan/Domain-Portfolio/main}"
 APP_DIR="/opt/domain-manager"
 DATA_DIR="/var/lib/domain-manager"
 APP="$APP_DIR/domain_manager.py"
