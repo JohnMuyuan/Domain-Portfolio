@@ -60,6 +60,28 @@ def test_rdap_normalization_extracts_asset_record():
     assert record["healthy"] is False
 
 
+def test_rdap_normalization_reads_li_registrar_org():
+    record = domain_manager.normalize_rdap(
+        {
+            "status": ["active"],
+            "secureDNS": {"delegationSigned": False},
+            "entities": [
+                {
+                    "roles": ["registrar"],
+                    "vcardArray": [
+                        "vcard",
+                        [["org", {}, "text", "Hosting Concepts B.V. d/b/a Registrar.eu "]],
+                    ],
+                    "url": "https://www.openprovider.com",
+                }
+            ],
+        }
+    )
+    assert record["registrar"] == "Hosting Concepts B.V. d/b/a Registrar.eu"
+    assert record["statuses"] == ["active"]
+    assert record["secure_dns"] is False
+
+
 def test_registration_lookup_falls_back_to_registry_whois():
     whois_text = """domain: yp.mk
 registrar: MARCOM-REG

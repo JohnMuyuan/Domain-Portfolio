@@ -162,8 +162,12 @@ def normalize_rdap(payload):
         vcard = entity.get("vcardArray", [])
         properties = vcard[1] if isinstance(vcard, list) and len(vcard) > 1 else []
         registrar = next(
-            (str(item[3]) for item in properties if isinstance(item, list) and len(item) > 3 and item[0] == "fn"),
-            str(entity.get("handle", "")),
+            (
+                str(item[3]).strip()
+                for item in properties
+                if isinstance(item, list) and len(item) > 3 and item[0] in {"fn", "org"} and item[3]
+            ),
+            str(entity.get("handle", "")).strip(),
         )
         break
     statuses = [str(status) for status in (payload.get("status") or [])]
@@ -180,7 +184,11 @@ def normalize_rdap(payload):
             for item in (payload.get("nameservers") or [])
             if isinstance(item, dict) and (item.get("ldhName") or item.get("unicodeName"))
         ),
-        "secure_dns": bool(payload.get("secureDNS", {}).get("delegationSigned")) if isinstance(payload.get("secureDNS"), dict) else False,
+        "secure_dns": (
+            bool(payload["secureDNS"]["delegationSigned"])
+            if isinstance(payload.get("secureDNS"), dict) and "delegationSigned" in payload["secureDNS"]
+            else None
+        ),
         "healthy": healthy,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -258,6 +266,7 @@ def normalize_whois(text):
     registrar = values("Registrar")
     statuses = values("Domain Status", "status")
     nameservers = sorted({value.split()[0].rstrip(".").lower() for value in values("Name Server", "nserver")})
+    dnssec = values("DNSSEC")
     if not (created or expires or registrar or nameservers):
         raise ValueError("WHOIS 没有返回可识别的注册数据")
     problem_statuses = {"redemptionperiod", "pendingdelete", "serverhold", "clienthold", "inactive"}
@@ -268,7 +277,7 @@ def normalize_whois(text):
         "registrar": registrar[0] if registrar else "",
         "statuses": statuses,
         "nameservers": nameservers,
-        "secure_dns": any("signed" in value.lower() and "unsigned" not in value.lower() for value in values("DNSSEC")),
+        "secure_dns": any("signed" in value.lower() and "unsigned" not in value.lower() for value in dnssec) if dnssec else None,
         "healthy": not any(re.sub(r"[^a-z]", "", status.lower()) in problem_statuses for status in statuses),
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1121,7 +1130,7 @@ function renderCards(){const visible=filteredDomains();$('#sectionCount').textCo
 function renderList(){showList(false);renderOverview();renderAssetBar();renderCards()}
 function blank(){return{id:null,name:'',expires_at:'',registrar:'',renewal_amount:'',renewal_currency:'CNY',renewal_years:1,renewal_price:'',renewal_url:'',auto_renew:false,notes:''}}
 function problemWhoisStatus(status){return ['redemptionperiod','pendingdelete','serverhold','clienthold','inactive'].includes(String(status).toLowerCase().replace(/[^a-z]/g,''))}
-function archiveBody(d,loading,error){const w=d.whois;if(!w)return `<div class="archive-note ${error?'error':''}">${loading?'正在查询公开注册档案…':escapeHtml(error||'暂时没有可用的公开注册档案，点击右上角重新查询。')}</div>`;const statuses=w.statuses?.length?w.statuses.map(s=>`<span class="status-chip ${problemWhoisStatus(s)?'danger':''}">${escapeHtml(s)}</span>`).join(''):'<span class="muted">注册局未返回状态</span>';const nameservers=w.nameservers?.length?w.nameservers.map(s=>`<span class="nameserver-chip">${escapeHtml(s)}</span>`).join(''):'<span class="muted">注册局未返回 Nameserver</span>';const parentNote=w.is_parent?`<div class="archive-note parent-note">${escapeHtml(d.name)} 是子域名，公开注册档案只能查询上级注册域名 ${escapeHtml(w.queried_name)}。</div>`:'';return `${parentNote}<div class="record-grid"><dl class="record"><dt>创建时间</dt><dd>${escapeHtml(w.created_at||'暂无数据')}</dd></dl><dl class="record"><dt>真实到期时间</dt><dd>${escapeHtml(w.expires_at||'暂无数据')}</dd></dl><dl class="record"><dt>最后更新</dt><dd>${escapeHtml(w.updated_at||'暂无数据')}</dd></dl><dl class="record"><dt>注册商</dt><dd>${escapeHtml(effectiveRegistrar(d)||'暂无数据')}</dd></dl><dl class="record"><dt>续费价格</dt><dd title="原价：${escapeAttr(d.renewal_price||'未填写')}">${escapeHtml(convertedPrice(d))}</dd></dl><dl class="record"><dt>DNSSEC</dt><dd>${w.secure_dns?'已签名':'未签名或未知'}</dd></dl><dl class="record"><dt>自动续费</dt><dd>${d.auto_renew?'已开启':'未开启'}</dd></dl></div><div class="archive-section"><h3>域名状态</h3><div class="status-list">${statuses}</div></div><div class="archive-section"><h3>Nameserver</h3><div class="nameserver-list">${nameservers}</div></div><div class="archive-section"><h3>资产备注</h3><div class="archive-note">${escapeHtml(d.notes||'暂无备注')}</div></div><div class="archive-foot">查询时间：${escapeHtml(w.checked_at?new Date(w.checked_at).toLocaleString():'未知')} · 数据源：${escapeHtml(w.source||'RDAP')} · 查询对象：${escapeHtml(w.queried_name||d.name)}</div>`}
+function archiveBody(d,loading,error){const w=d.whois;if(!w)return `<div class="archive-note ${error?'error':''}">${loading?'正在查询公开注册档案…':escapeHtml(error||'暂时没有可用的公开注册档案，点击右上角重新查询。')}</div>`;const statuses=w.statuses?.length?w.statuses.map(s=>`<span class="status-chip ${problemWhoisStatus(s)?'danger':''}">${escapeHtml(s)}</span>`).join(''):'<span class="muted">注册局未返回状态</span>';const nameservers=w.nameservers?.length?w.nameservers.map(s=>`<span class="nameserver-chip">${escapeHtml(s)}</span>`).join(''):'<span class="muted">注册局未返回 Nameserver</span>';const parentNote=w.is_parent?`<div class="archive-note parent-note">${escapeHtml(d.name)} 是子域名，公开注册档案只能查询上级注册域名 ${escapeHtml(w.queried_name)}。</div>`:'';return `${parentNote}<div class="record-grid"><dl class="record"><dt>创建时间</dt><dd>${escapeHtml(w.created_at||'暂无数据')}</dd></dl><dl class="record"><dt>真实到期时间</dt><dd>${escapeHtml(w.expires_at||'暂无数据')}</dd></dl><dl class="record"><dt>最后更新</dt><dd>${escapeHtml(w.updated_at||'暂无数据')}</dd></dl><dl class="record"><dt>注册商</dt><dd>${escapeHtml(effectiveRegistrar(d)||'暂无数据')}</dd></dl><dl class="record"><dt>续费价格</dt><dd title="原价：${escapeAttr(d.renewal_price||'未填写')}">${escapeHtml(convertedPrice(d))}</dd></dl><dl class="record"><dt>DNSSEC</dt><dd>${w.secure_dns===true?'已签名':w.secure_dns===false?'未签名':'未知'}</dd></dl><dl class="record"><dt>自动续费</dt><dd>${d.auto_renew?'已开启':'未开启'}</dd></dl></div><div class="archive-section"><h3>域名状态</h3><div class="status-list">${statuses}</div></div><div class="archive-section"><h3>Nameserver</h3><div class="nameserver-list">${nameservers}</div></div><div class="archive-section"><h3>资产备注</h3><div class="archive-note">${escapeHtml(d.notes||'暂无备注')}</div></div><div class="archive-foot">查询时间：${escapeHtml(w.checked_at?new Date(w.checked_at).toLocaleString():'未知')} · 数据源：${escapeHtml(w.source||'RDAP')} · 查询对象：${escapeHtml(w.queried_name||d.name)}</div>`}
 function openDetail(id){current=domains.find(d=>d.id===id);if(!current)return loadDomains();settingsView.classList.add('hidden');listView.classList.add('hidden');detailView.classList.remove('hidden');activateNav('home');renderDetail(!current.whois);enterView(detailView);loadWhois(false)}
 function renderDetail(loading=false,error=''){const d=current,[state,label]=statusInfo(d);detailView.innerHTML=`<div class="toolbar"><div><div class="page-kicker">Asset detail</div><h1>${escapeHtml(d.name)}</h1><span class="status ${state==='danger'?'danger':state==='warn'?'warn':''}">${label}</span></div><div class="detail-actions"><button class="btn" id="backBtn">${ICONS.back}返回</button><a class="btn ${d.renewal_url?'':'hidden'}" href="${escapeAttr(d.renewal_url)}" target="_blank" rel="noopener">去续费</a><button class="btn primary" id="editBtn">${ICONS.edit}编辑</button></div></div><div class="detail"><section class="panel"><div class="archive-head"><div><h2>WHOIS 资产档案</h2><p>来自注册局的公开 RDAP / WHOIS 数据，用于判断域名真实状态。</p></div><button class="btn" id="refreshWhoisBtn">${ICONS.refresh}刷新档案</button></div>${archiveBody(d,loading,error)}</section></div>`;backBtn.onclick=loadDomains;editBtn.onclick=()=>openEdit(d.id);refreshWhoisBtn.onclick=()=>loadWhois(true)}
 async function loadWhois(refresh){const id=current.id,button=$('#refreshWhoisBtn');if(refresh)setBusy(button,true,'查询中');try{const data=await api(`/api/domains/${id}/whois${refresh?'?refresh=1':''}`);if(current?.id!==id)return;current.whois=data.whois;current.whois_checked_at=data.whois.checked_at;const listed=domains.find(d=>d.id===id);if(listed)Object.assign(listed,{whois:data.whois,whois_checked_at:data.whois.checked_at});renderDetail();if(data.warning)toast(data.warning,'error')}catch(e){if(current?.id===id)renderDetail(false,e.message)}}
