@@ -8,12 +8,28 @@ def test_domain_validation():
         "name": "Example.COM",
         "expires_at": "2027-01-02",
         "registrar": "Cloudflare",
-        "renewal_price": "10 USD / 年",
+        "renewal_amount": "129.90",
+        "renewal_currency": "USD",
+        "renewal_years": 2,
     }
 
     domain = domain_manager.clean_domain(payload)
 
     assert domain["name"] == "example.com"
+    assert domain["renewal_amount"] == "129.9"
+    assert domain["renewal_price"] == "129.9 USD / 2 年"
+
+
+def test_legacy_renewal_price_is_migrated_and_invalid_amount_rejected():
+    domain = domain_manager.clean_domain({"name": "legacy.test", "renewal_price": "10 USD / 年"})
+
+    assert (domain["renewal_amount"], domain["renewal_currency"], domain["renewal_years"]) == ("10", "USD", 1)
+    try:
+        domain_manager.clean_domain({"name": "bad.test", "renewal_amount": "12.345", "renewal_currency": "CNY", "renewal_years": 1})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid renewal amount accepted")
 
 
 def test_rdap_normalization_extracts_asset_record():
