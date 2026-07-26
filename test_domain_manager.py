@@ -60,6 +60,63 @@ def test_rdap_normalization_extracts_asset_record():
     assert record["healthy"] is False
 
 
+def test_registration_lookup_falls_back_to_registry_whois():
+    whois_text = """domain: yp.mk
+registrar: MARCOM-REG
+registered: 22.06.2026 18:35:07
+expire: 22.06.2027
+nserver: maleah.ns.cloudflare.com
+nserver: marty.ns.cloudflare.com
+"""
+    original_rdap = domain_manager.fetch_rdap
+    original_referral = getattr(domain_manager, "whois_referral", None)
+    original_whois = getattr(domain_manager, "fetch_whois_text", None)
+
+    def rdap_unavailable(_name):
+        raise ValueError("RDAP unavailable")
+
+    domain_manager.fetch_rdap = rdap_unavailable
+    domain_manager.whois_referral = lambda _tld: "whois.marnet.mk"
+    domain_manager.fetch_whois_text = lambda _host, _name: whois_text
+    try:
+        record = domain_manager.fetch_registration("yp.mk")
+    finally:
+        domain_manager.fetch_rdap = original_rdap
+        if original_referral is None:
+            del domain_manager.whois_referral
+        else:
+            domain_manager.whois_referral = original_referral
+        if original_whois is None:
+            del domain_manager.fetch_whois_text
+        else:
+            domain_manager.fetch_whois_text = original_whois
+
+    assert record["source"] == "WHOIS"
+    assert record["created_at"] == "2026-06-22"
+    assert record["expires_at"] == "2027-06-22"
+    assert record["registrar"] == "MARCOM-REG"
+    assert record["nameservers"] == ["maleah.ns.cloudflare.com", "marty.ns.cloudflare.com"]
+
+
+def test_registration_lookup_uses_registered_parent_for_subdomain():
+    original_rdap = domain_manager.fetch_rdap
+
+    def parent_only(name):
+        if name != "dpdns.org":
+            raise ValueError("not registered")
+        return {"expires_at": "2029-03-13", "registrar": "Gandi SAS"}
+
+    domain_manager.fetch_rdap = parent_only
+    try:
+        record = domain_manager.fetch_registration("muyno.dpdns.org")
+    finally:
+        domain_manager.fetch_rdap = original_rdap
+
+    assert record["queried_name"] == "dpdns.org"
+    assert record["is_parent"] is True
+    assert record["expires_at"] == "2029-03-13"
+
+
 def test_exchange_rates_are_normalized_with_fallbacks():
     rates = domain_manager.normalize_exchange_rates({"rates": {"CNY": 7.25, "EUR": "0.84", "JPY": -1}})
 
