@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from datetime import date, datetime, timezone
 from email.message import EmailMessage
@@ -51,8 +52,13 @@ DEFAULTS = {
 }
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.I)
 SESSION_TTL = 12 * 60 * 60
+RDAP_CACHE_SECONDS = 24 * 60 * 60
+EXCHANGE_CACHE_SECONDS = 12 * 60 * 60
+FALLBACK_EXCHANGE_RATES = {"USD": 1, "CNY": 7.2, "EUR": 0.86, "GBP": 0.75, "HKD": 7.8, "JPY": 145}
 sessions = {}
 store_lock = threading.Lock()
+exchange_lock = threading.Lock()
+exchange_cache = {}
 
 
 def now_ts():
@@ -130,6 +136,125 @@ def save_store(data_dir, store):
     write_json(domains_path(data_dir), store)
 
 
+def rdap_date(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date().isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
+def normalize_rdap(payload):
+    events = {
+        str(item.get("eventAction", "")).lower(): rdap_date(item.get("eventDate"))
+        for item in (payload.get("events") or [])
+        if isinstance(item, dict)
+    }
+    registrar = ""
+    for entity in (payload.get("entities") or []):
+        if not isinstance(entity, dict) or "registrar" not in (entity.get("roles") or []):
+            continue
+        vcard = entity.get("vcardArray", [])
+        properties = vcard[1] if isinstance(vcard, list) and len(vcard) > 1 else []
+        registrar = next(
+            (str(item[3]) for item in properties if isinstance(item, list) and len(item) > 3 and item[0] == "fn"),
+            str(entity.get("handle", "")),
+        )
+        break
+    statuses = [str(status) for status in (payload.get("status") or [])]
+    problem_statuses = {"redemptionperiod", "pendingdelete", "serverhold", "clienthold", "inactive"}
+    healthy = not any(re.sub(r"[^a-z]", "", status.lower()) in problem_statuses for status in statuses)
+    return {
+        "created_at": events.get("registration", ""),
+        "expires_at": events.get("expiration", ""),
+        "updated_at": events.get("last changed", ""),
+        "registrar": registrar,
+        "statuses": statuses,
+        "nameservers": sorted(
+            str(item.get("ldhName") or item.get("unicodeName") or "").lower()
+            for item in (payload.get("nameservers") or [])
+            if isinstance(item, dict) and (item.get("ldhName") or item.get("unicodeName"))
+        ),
+        "secure_dns": bool(payload.get("secureDNS", {}).get("delegationSigned")) if isinstance(payload.get("secureDNS"), dict) else False,
+        "healthy": healthy,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def fetch_rdap(domain_name):
+    url = "https://rdap.org/domain/" + urllib.parse.quote(domain_name, safe="")
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/rdap+json, application/json", "User-Agent": "DomainManager/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("RDAP 返回内容无效")
+    try:
+        return normalize_rdap(payload)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("RDAP 返回内容无效") from exc
+
+
+def whois_cache_fresh(checked_at):
+    try:
+        checked = datetime.fromisoformat(str(checked_at).replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - checked).total_seconds() < RDAP_CACHE_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_exchange_rates(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("汇率返回内容无效")
+    rates = dict(FALLBACK_EXCHANGE_RATES)
+    for currency, value in (payload.get("rates") or {}).items():
+        if currency not in rates:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            rates[currency] = number
+    rates["USD"] = 1
+    return rates
+
+
+def get_exchange_rates():
+    with exchange_lock:
+        if exchange_cache.get("expires_at", 0) > now_ts():
+            return dict(exchange_cache)
+    request = urllib.request.Request(
+        "https://api.frankfurter.dev/v1/latest?base=USD&symbols=CNY,EUR,GBP,HKD,JPY",
+        headers={"Accept": "application/json", "User-Agent": "DomainManager/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        result = {
+            "rates": normalize_exchange_rates(payload),
+            "date": str(payload.get("date", "")),
+            "source": "Frankfurter / ECB",
+            "expires_at": now_ts() + EXCHANGE_CACHE_SECONDS,
+        }
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        with exchange_lock:
+            rates = exchange_cache.get("rates")
+        result = {
+            "rates": rates or dict(FALLBACK_EXCHANGE_RATES),
+            "date": "",
+            "source": "参考汇率",
+            "expires_at": now_ts() + 60 * 60,
+        }
+    with exchange_lock:
+        exchange_cache.clear()
+        exchange_cache.update(result)
+    return dict(result)
+
+
 def parse_reminder_days(value):
     days = []
     for part in re.split(r"[,，\s]+", str(value or "")):
@@ -152,6 +277,10 @@ def days_until(expires_at):
     except ValueError:
         return None
     return (target - date.today()).days
+
+
+def domain_expiry(domain):
+    return (domain.get("whois") or {}).get("expires_at") or domain.get("expires_at")
 
 
 def clean_settings(payload, current):
@@ -192,9 +321,10 @@ def expiring_domains(domains, reminder_days):
     reminder_set = set(reminder_days)
     matches = []
     for domain in domains:
-        left = days_until(domain.get("expires_at"))
+        left = days_until(domain_expiry(domain))
         if left in reminder_set:
             item = dict(domain)
+            item["expires_at"] = domain_expiry(domain)
             item["days_left"] = left
             matches.append(item)
     return sorted(matches, key=lambda item: (item["days_left"], item["name"]))
@@ -366,7 +496,7 @@ def clean_domain(payload, existing=None):
             datetime.strptime(expires_at, "%Y-%m-%d")
         except ValueError as exc:
             raise ValueError("到期时间格式应为 YYYY-MM-DD") from exc
-    return {
+    domain = {
         "id": existing.get("id") or secrets.token_hex(8),
         "name": name,
         "expires_at": expires_at,
@@ -377,6 +507,10 @@ def clean_domain(payload, existing=None):
         "notes": str(payload.get("notes", "")).strip(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if existing.get("name") == name and existing.get("whois"):
+        domain["whois"] = existing["whois"]
+        domain["whois_checked_at"] = existing.get("whois_checked_at", "")
+    return domain
 
 
 class DomainHandler(BaseHTTPRequestHandler):
@@ -448,6 +582,10 @@ class DomainHandler(BaseHTTPRequestHandler):
             with store_lock:
                 domains = load_store(self.data_dir)["domains"]
             return self.send_json(200, {"domains": domains})
+        if parts[1:] == ["exchange-rates"]:
+            rates = get_exchange_rates()
+            rates.pop("expires_at", None)
+            return self.send_json(200, rates)
         if parts[1:] == ["settings"]:
             with store_lock:
                 config = load_config(self.data_dir)
@@ -458,14 +596,17 @@ class DomainHandler(BaseHTTPRequestHandler):
                 config = load_config(self.data_dir)
                 domains = load_store(self.data_dir).get("domains", [])
             preview_domains = []
-            for domain in sorted(domains, key=lambda item: (item.get("expires_at") or "9999-12-31", item.get("name", "")))[:5]:
+            for domain in sorted(domains, key=lambda item: (domain_expiry(item) or "9999-12-31", item.get("name", "")))[:5]:
                 item = dict(domain)
-                item["days_left"] = days_until(item.get("expires_at"))
+                item["expires_at"] = domain_expiry(domain)
+                item["days_left"] = days_until(item["expires_at"])
                 preview_domains.append(item)
             return self.send_json(200, {"html": email_html(preview_domains, config)})
+        if len(parts) == 4 and parts[1] == "domains" and parts[3] == "whois":
+            return self.domain_whois(parts[2])
         if len(parts) == 3 and parts[1] == "domains":
             domain = self.find_domain(parts[2])
-            return self.send_json(200, {"domain": domain} if domain else {"error": "域名不存在"})
+            return self.send_json(200, {"domain": domain}) if domain else self.send_json(404, {"error": "域名不存在"})
         self.send_json(404, {"error": "接口不存在"})
 
     def do_POST(self):
@@ -534,6 +675,30 @@ class DomainHandler(BaseHTTPRequestHandler):
                     return domain
         return None
 
+    def domain_whois(self, domain_id):
+        domain = self.find_domain(domain_id)
+        if not domain:
+            return self.send_json(404, {"error": "域名不存在"})
+        refresh = urllib.parse.parse_qs(urlparse(self.path).query).get("refresh") == ["1"]
+        cached = domain.get("whois")
+        if cached and not refresh and whois_cache_fresh(domain.get("whois_checked_at")):
+            return self.send_json(200, {"whois": cached, "cached": True})
+        try:
+            whois = fetch_rdap(domain["name"])
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+            if cached:
+                return self.send_json(200, {"whois": cached, "cached": True, "stale": True, "warning": "WHOIS 查询暂时失败，当前显示上次查询结果"})
+            return self.send_json(502, {"error": "WHOIS 查询暂时失败，请稍后重试"})
+        with store_lock:
+            store = load_store(self.data_dir)
+            target = next((item for item in store["domains"] if item["id"] == domain_id), None)
+            if not target or target["name"] != domain["name"]:
+                return self.send_json(409, {"error": "域名信息已变化，请重新打开详情"})
+            target["whois"] = whois
+            target["whois_checked_at"] = whois["checked_at"]
+            save_store(self.data_dir, store)
+        return self.send_json(200, {"whois": whois, "cached": False})
+
     def upsert_domain(self, domain_id):
         try:
             body = self.read_body()
@@ -580,9 +745,10 @@ class DomainHandler(BaseHTTPRequestHandler):
                 domains = load_store(self.data_dir).get("domains", [])
             config["email_enabled"] = True
             preview = []
-            for domain in sorted(domains, key=lambda item: (item.get("expires_at") or "9999-12-31", item.get("name", "")))[:5]:
+            for domain in sorted(domains, key=lambda item: (domain_expiry(item) or "9999-12-31", item.get("name", "")))[:5]:
                 item = dict(domain)
-                item["days_left"] = days_until(item.get("expires_at"))
+                item["expires_at"] = domain_expiry(domain)
+                item["days_left"] = days_until(item["expires_at"])
                 preview.append(item)
             send_email(config, preview, "域名管理器测试邮件")
         except ValueError as exc:
@@ -722,7 +888,7 @@ html[data-theme=dark]{--bg:#101214;--bg-soft:#171a1e;--fg:#f2f4f7;--muted:#a3abb
 .login{min-height:100vh;display:grid;place-items:center;padding:24px;background:linear-gradient(180deg,var(--bg-soft),var(--bg))}.login-box{position:relative;width:min(430px,100%);background:var(--card);border:1px solid var(--border);border-radius:8px;padding:26px;box-shadow:var(--shadow)}.login-box h1{margin:22px 0 16px;font-size:26px}.login .theme-switch{position:fixed;right:18px;top:18px;z-index:3;border-color:var(--border);background:var(--card-solid)}.login .theme-option{color:var(--muted)}.login .theme-option:hover{color:var(--fg);background:var(--primary-soft)}
 @media(max-width:820px){.nav{padding:10px 14px;flex-wrap:wrap}.brand{font-size:18px}.theme-switch{order:3;margin-left:auto}.main{padding:22px 14px 44px}.toolbar{align-items:stretch;flex-direction:column}.toolbar h1{font-size:27px}.overview,.settings-layout{grid-template-columns:1fr}.metric-grid{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.card{min-height:184px}.panel{padding:18px}.btn{width:100%}.top .btn{width:auto}}
 body,.top,.card,.panel,input,textarea,select,.asset-band,.rank-section{transition:background-color .28s ease,border-color .28s ease,color .28s ease,box-shadow .28s ease}button:active,.btn:active{transform:translateY(1px) scale(.98)!important}.btn svg,.nav-btn svg{width:17px;height:17px;flex:0 0 auto}.nav{gap:9px}.nav-btn,.nav>#homeBtn,.nav>#settingsBtn,.nav>#logoutBtn{min-height:38px;padding:8px 12px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--header-muted);display:inline-flex;align-items:center;gap:7px;font:inherit;font-weight:700;box-shadow:none;transition:color .18s,background .18s,border-color .18s,transform .18s}.nav-btn:hover,.nav>#homeBtn:hover,.nav>#settingsBtn:hover,.nav>#logoutBtn:hover{color:var(--header-fg);background:var(--header-hover);border-color:transparent;box-shadow:none}.nav-btn.active,.nav>#homeBtn.active,.nav>#settingsBtn.active{color:var(--header-fg);background:var(--header-hover);border-color:var(--header-border)}.nav-divider{width:1px;height:26px;background:var(--header-border);margin:0 3px}.view-enter{animation:view-in .32s cubic-bezier(.2,.8,.2,1) both}@keyframes view-in{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
-.toolbar{margin-bottom:24px}.toolbar h1{letter-spacing:0}.page-kicker{display:flex;align-items:center;gap:8px;color:var(--primary);font-size:12px;font-weight:850;text-transform:uppercase;margin-bottom:7px}.page-kicker:before{content:'';width:18px;height:2px;background:var(--primary)}.overview{grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);gap:0;margin:0 0 30px;border-block:1px solid var(--border);background:transparent}.asset-band,.rank-section{padding:24px 0;background:transparent}.asset-band{padding-right:28px}.rank-section{padding-left:28px;border-left:1px solid var(--border)}.metric-title,.rank-title{margin-bottom:16px}.metric-title h2,.rank-title h2{font-size:15px;color:var(--muted)}.metric-value{font-size:38px}.metric-grid{display:flex;gap:0;margin-top:22px}.mini-metric{flex:1;padding:0 18px;border:0;border-left:1px solid var(--border);border-radius:0;background:transparent}.mini-metric:first-child{padding-left:0;border-left:0}.mini-metric b{font-size:21px;margin-top:4px}.rank-list{gap:0}.rank-item{padding:10px 0;border:0;border-top:1px solid var(--border);border-radius:0;background:transparent;transition:padding .18s,background .18s}.rank-item:hover{padding-left:8px;padding-right:8px;background:var(--input)}.rank-item:first-child{border-top:0}.rank-index{border-radius:7px}.section-bar{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:0 0 14px}.section-bar h2{margin:0;font-size:18px}.section-count{color:var(--muted);font-size:13px}.grid{gap:16px}.card{min-height:210px;animation:card-in .36s cubic-bezier(.2,.8,.2,1) both;animation-delay:calc(var(--i,0)*45ms)}@keyframes card-in{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}.card:hover{transform:translateY(-4px)}.card .status{transition:transform .18s}.card:hover .status{transform:translateY(-1px)}.card>*:not(.registrar-mark){position:relative;z-index:1}.card .meta .row:last-child{padding-right:52px}.tag-line{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.auto-badge{border-radius:999px;padding:5px 9px;background:var(--success-soft);color:var(--success);font-size:12px;font-weight:800}.registrar-mark{position:absolute;right:12px;bottom:10px;z-index:0;width:44px;height:44px;display:grid;place-items:center;border-radius:14px;background:var(--registrar-color,#64748b);color:white;font-size:19px;font-weight:900;opacity:.48;box-shadow:inset 0 1px 0 #ffffff70;pointer-events:none}.registrar-mark.registrar-cloudflare{--registrar-color:#f48120}.registrar-mark.registrar-namecheap{--registrar-color:#de3723}.registrar-mark.registrar-godaddy{--registrar-color:#00a4a6}.registrar-mark.registrar-aliyun{--registrar-color:#ff6a00}.registrar-mark.registrar-tencent{--registrar-color:#006eff}.registrar-mark.registrar-namesilo{--registrar-color:#2667b1}.registrar-mark.registrar-porkbun{--registrar-color:#ef7878}.registrar-mark.registrar-dynadot{--registrar-color:#278fd2}
+.toolbar{margin-bottom:24px}.toolbar h1{letter-spacing:0}.page-kicker{display:flex;align-items:center;gap:8px;color:var(--primary);font-size:12px;font-weight:850;text-transform:uppercase;margin-bottom:7px}.page-kicker:before{content:'';width:18px;height:2px;background:var(--primary)}.overview{grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);gap:0;margin:0 0 30px;border-block:1px solid var(--border);background:transparent}.asset-band,.rank-section{padding:24px 0;background:transparent}.asset-band{padding-right:28px}.rank-section{padding-left:28px;border-left:1px solid var(--border)}.metric-title,.rank-title{margin-bottom:16px}.metric-title h2,.rank-title h2{font-size:15px;color:var(--muted)}.metric-value{font-size:38px}.metric-grid{display:flex;gap:0;margin-top:22px}.mini-metric{flex:1;padding:0 18px;border:0;border-left:1px solid var(--border);border-radius:0;background:transparent}.mini-metric:first-child{padding-left:0;border-left:0}.mini-metric b{font-size:21px;margin-top:4px}.rank-list{gap:0}.rank-item{padding:10px 0;border:0;border-top:1px solid var(--border);border-radius:0;background:transparent;transition:padding .18s,background .18s}.rank-item:hover{padding-left:8px;padding-right:8px;background:var(--input)}.rank-item:first-child{border-top:0}.rank-index{border-radius:7px}.section-bar{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:0 0 14px}.section-bar h2{margin:0;font-size:18px}.section-count{color:var(--muted);font-size:13px}.grid{gap:16px}.card{min-height:210px;animation:card-in .36s cubic-bezier(.2,.8,.2,1) both;animation-delay:calc(var(--i,0)*45ms)}@keyframes card-in{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}.card:hover{transform:translateY(-4px)}.card .status{transition:transform .18s}.card:hover .status{transform:translateY(-1px)}.card>*:not(.registrar-mark){position:relative;z-index:1}.card .meta .row:last-child{padding-right:56px}.tag-line{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.auto-badge{border-radius:999px;padding:5px 9px;background:var(--success-soft);color:var(--success);font-size:12px;font-weight:800}.registrar-mark{position:absolute;right:12px;bottom:10px;z-index:0;width:48px;height:48px;padding:8px;display:grid;place-items:center;border:1px solid var(--glass-border);border-radius:15px;background:color-mix(in srgb,var(--glass-strong) 82%,transparent);color:var(--muted);font-size:18px;font-weight:900;opacity:.82;box-shadow:inset 0 1px 0 var(--glass-highlight),0 6px 18px #00000012;pointer-events:none}.registrar-mark svg,.registrar-mark img{display:block;width:100%;height:100%;object-fit:contain}.registrar-mark.registrar-generic{padding:0}
 .detail{max-width:900px;margin:auto}.detail .panel{padding:26px}.detail-actions{display:flex;gap:9px;flex-wrap:wrap}.settings-layout{align-items:start}.settings-panel{padding:0;overflow:hidden}.settings-tabs{display:grid;grid-template-columns:repeat(3,1fr);border-bottom:1px solid var(--border);background:var(--input)}.settings-tab{position:relative;min-height:48px;border:0;border-right:1px solid var(--border);background:transparent;color:var(--muted);font:inherit;font-weight:750;cursor:pointer}.settings-tab:last-child{border-right:0}.settings-tab.active{color:var(--primary);background:var(--card-solid)}.settings-tab.active:after{content:'';position:absolute;left:22%;right:22%;bottom:-1px;height:2px;background:var(--primary)}.settings-pane{padding:22px;animation:view-in .24s both}.settings-pane[hidden]{display:none}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.form-grid .wide{grid-column:1/-1}.switch-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:13px 0;border-bottom:1px solid var(--border);font-weight:750}.switch-copy{display:grid;gap:4px}.switch-copy b{font-size:14px}.switch-copy small{color:var(--muted);font-size:12px;font-weight:500;line-height:1.5}.switch-row input{position:absolute;width:1px;height:1px;margin:0;opacity:0;pointer-events:none}.switch-track{position:relative;width:44px;height:24px;flex:0 0 auto;border-radius:99px;background:var(--border);transition:background .2s}.switch-track:after{content:'';position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:white;box-shadow:0 2px 7px #0003;transition:transform .22s cubic-bezier(.2,.8,.2,1)}.switch-row input:checked+.switch-track{background:var(--primary)}.switch-row input:checked+.switch-track:after{transform:translateX(20px)}.switch-row:focus-within .switch-track{box-shadow:0 0 0 4px var(--ring)}.preview-panel{position:sticky;top:88px}.preview-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px}.preview-head h2{margin:0}.preview-status{font-size:12px;color:var(--muted)}.preview-frame{height:580px;transition:opacity .2s}.preview-frame.loading{opacity:.35}.skeleton{position:relative;overflow:hidden;background:var(--input);border-radius:8px}.skeleton:after{content:'';position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,#ffffff18,transparent);animation:shimmer 1.2s infinite}@keyframes shimmer{to{transform:translateX(100%)}}.skeleton-card{height:210px;border:1px solid var(--border)}
 .toast-stack{position:fixed;right:18px;top:86px;z-index:50;display:grid;gap:10px;width:min(360px,calc(100vw - 36px));pointer-events:none}.toast{display:grid;grid-template-columns:24px minmax(0,1fr);gap:10px;align-items:center;padding:13px 14px;border:1px solid var(--border);border-left:3px solid var(--success);border-radius:8px;background:var(--card-solid);color:var(--fg);box-shadow:0 18px 45px #0004;animation:toast-in .28s cubic-bezier(.2,.8,.2,1) both;pointer-events:auto}.toast.error{border-left-color:var(--danger)}.toast.out{animation:toast-out .2s ease both}@keyframes toast-in{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:none}}@keyframes toast-out{to{opacity:0;transform:translateX(18px)}}.toast-icon{width:24px;height:24px;display:grid;place-items:center;border-radius:50%;background:var(--success-soft);color:var(--success);font-weight:900}.toast.error .toast-icon{background:var(--danger-soft);color:var(--danger)}.btn.busy{pointer-events:none;opacity:.78}.btn.busy svg{animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .skeleton-band{height:180px;margin:18px;border:1px solid var(--border)}
@@ -733,6 +899,8 @@ body,.top,.card,.panel,input,textarea,select,.asset-band,.rank-section{transitio
 @media(max-width:760px){.login{place-items:start center;padding:76px 14px 24px}.login-layout{min-height:0;grid-template-columns:1fr}.login-brand{padding:28px 25px}.login-brand-mark{width:46px;height:46px;margin-bottom:20px}.login-brand h1{font-size:31px;margin:9px 0 11px}.login-brand>p{font-size:14px}.login-points{display:none}.login-panel{padding:30px 25px 34px}.pane-actions{align-items:stretch;flex-direction:column}.pane-actions .btn{width:100%}}
 
 /* Liquid glass theme */
+.logo{font-size:0}.logo:before{content:'';width:23px;height:23px;background:center/contain no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18'/%3E%3Cpath d='m15.5 8.5 2 2 3-3'/%3E%3C/svg%3E")}
+.metric-title{flex-wrap:wrap}.currency-switch{display:flex;gap:3px;padding:3px;border:1px solid var(--glass-border);border-radius:13px;background:var(--brand-tile)}.currency-option{width:34px;height:30px;padding:0;border:0;border-radius:10px;background:transparent;color:var(--muted);font-weight:850}.currency-option:hover{color:var(--fg);background:var(--header-hover)}.currency-option.active{color:var(--primary);background:var(--glass-strong);box-shadow:inset 0 1px 0 var(--glass-highlight),0 3px 9px #0002}
 :root{--glass:#ffffffa8;--glass-strong:#ffffffe0;--glass-border:#ffffffc9;--glass-highlight:#ffffffeb;--glass-shadow:0 18px 48px #47627c1c,0 3px 12px #47627c12;--glass-shadow-hover:0 24px 64px #3e57752b,0 6px 18px #3e57751a;--header:#ffffffa3;--header-fg:#1c2735;--header-muted:#5f6c7c;--header-border:#ffffffb8;--header-hover:#ffffffa8;--brand-tile:#ffffff70;--card:#ffffff9c;--card-solid:#ffffffe8;--input:#ffffff8f;--border:#8799ad4a;--shadow:var(--glass-shadow);--shadow-hover:var(--glass-shadow-hover)}
 html[data-theme=dark]{--glass:#171b22b8;--glass-strong:#242a33e8;--glass-border:#ffffff24;--glass-highlight:#ffffff1f;--glass-shadow:0 22px 58px #00000059,0 4px 16px #00000038;--glass-shadow-hover:0 28px 72px #00000073,0 8px 22px #00000045;--header:#12161cb5;--header-fg:#f4f7fb;--header-muted:#aeb8c6;--header-border:#ffffff20;--header-hover:#ffffff14;--brand-tile:#ffffff0e;--card:#191e25b8;--card-solid:#242a33ed;--input:#ffffff0d;--border:#ffffff20;--shadow:var(--glass-shadow);--shadow-hover:var(--glass-shadow-hover)}
 @media(prefers-color-scheme:dark){html[data-theme=auto]{--glass:#171b22b8;--glass-strong:#242a33e8;--glass-border:#ffffff24;--glass-highlight:#ffffff1f;--glass-shadow:0 22px 58px #00000059,0 4px 16px #00000038;--glass-shadow-hover:0 28px 72px #00000073,0 8px 22px #00000045;--header:#12161cb5;--header-fg:#f4f7fb;--header-muted:#aeb8c6;--header-border:#ffffff20;--header-hover:#ffffff14;--brand-tile:#ffffff0e;--card:#191e25b8;--card-solid:#242a33ed;--input:#ffffff0d;--border:#ffffff20;--shadow:var(--glass-shadow);--shadow-hover:var(--glass-shadow-hover)}}
@@ -744,6 +912,8 @@ body{background:linear-gradient(135deg,#e9f0fa 0%,#eef8f3 48%,#f5eff8 100%);back
 input,textarea,select{border-color:var(--glass-border);border-radius:14px;background:var(--input);box-shadow:inset 0 1px 0 var(--glass-highlight);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}input:hover,textarea:hover,select:hover{border-color:color-mix(in srgb,var(--primary) 40%,var(--glass-border))}.preview-frame,.empty,.skeleton{border-radius:18px}.settings-panel{border-radius:22px}.settings-tabs{background:#ffffff24}.settings-tab.active{background:var(--glass-strong)}.settings-tab:first-child{border-top-left-radius:21px}.settings-tab:last-child{border-top-right-radius:21px}.rank-item:hover{border-radius:13px;background:var(--glass)}.rank-index{border-radius:10px}.toast{border-radius:17px;background:var(--glass-strong)}
 .login{background:transparent}.login-layout{border-radius:30px;background:var(--glass)}.login-brand{background:linear-gradient(145deg,#2456a5df,#21727ad9);-webkit-backdrop-filter:saturate(160%) blur(20px);backdrop-filter:saturate(160%) blur(20px)}.login-brand-mark,.login-point>span{border-radius:14px;box-shadow:inset 0 1px 0 #ffffff55}.login-panel{background:linear-gradient(145deg,#ffffff16,transparent)}
 @media(max-width:820px){body{background-attachment:scroll}.top{top:7px;margin:7px 8px 0;border-radius:19px}.nav{padding:9px 11px}.main{padding:24px 14px 48px}.toolbar{gap:14px}.overview{margin-bottom:24px}.asset-band{padding-top:18px}.metric-value{font-size:34px}.card,.panel,.settings-panel{border-radius:18px}.card{min-height:190px;padding:17px}.settings-tab:first-child{border-top-left-radius:17px}.settings-tab:last-child{border-top-right-radius:17px}.preview-frame{height:400px;border-radius:15px}.toast-stack{top:124px;right:12px;width:calc(100vw - 24px)}.login-layout{border-radius:22px}.login-brand{border-radius:21px 21px 0 0}.login-panel{border-radius:0 0 21px 21px}}
+.archive-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:22px}.archive-head h2{margin-bottom:5px}.archive-head p{margin:0;color:var(--muted);font-size:13px}.record-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:34px}.record{display:grid;grid-template-columns:108px minmax(0,1fr);gap:12px;margin:0;padding:15px 0;border-top:1px solid var(--border)}.record dt{color:var(--muted);font-size:13px}.record dd{margin:0;font-weight:780;overflow-wrap:anywhere}.archive-section{margin-top:10px;padding-top:20px;border-top:1px solid var(--border)}.archive-section h3{margin:0 0 12px;font-size:14px}.status-list,.nameserver-list{display:flex;flex-wrap:wrap;gap:8px}.status-chip,.nameserver-chip{max-width:100%;padding:7px 10px;border-radius:999px;background:var(--success-soft);color:var(--success);font-size:12px;font-weight:750;overflow-wrap:anywhere}.status-chip.danger{background:var(--danger-soft);color:var(--danger)}.nameserver-chip{background:var(--primary-soft);color:var(--primary)}.archive-note{padding:20px 0;color:var(--muted);line-height:1.7}.archive-note.error{color:var(--danger)}.archive-foot{margin-top:20px;color:var(--muted);font-size:12px}
+@media(max-width:620px){.archive-head{align-items:stretch;flex-direction:column}.record-grid{grid-template-columns:1fr}.record{grid-template-columns:96px minmax(0,1fr)}.archive-head .btn{width:100%}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 </style>
 </head>
@@ -761,8 +931,10 @@ input,textarea,select{border-color:var(--glass-border);border-radius:14px;backgr
   <main class="main"><div id="listView"><div class="toolbar"><div><h1>我的域名</h1><div class="muted">集中查看域名资产、到期时间和续费入口。</div></div><button class="btn primary" id="addBtn">新增域名</button></div><div id="overview" class="overview"></div><div id="cards" class="grid"></div></div><div id="detailView" class="hidden"></div><div id="settingsView" class="hidden"></div></main>
 </div>
 <script>
-const $=s=>document.querySelector(s);let domains=[],current=null,settings=null,settingsTab='rules';
-const ICONS={spinner:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>',check:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>',back:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>',send:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>'};
+const $=s=>document.querySelector(s);let domains=[],current=null,settings=null,settingsTab='rules',displayCurrency=localStorage.getItem('dm_currency')||'CNY',exchangeRates={USD:1,CNY:7.2,EUR:.86,GBP:.75,HKD:7.8,JPY:145},exchangeRatesLoaded=false;
+const CURRENCY_META={CNY:{symbol:'¥',title:'人民币'},USD:{symbol:'$',title:'美元'},EUR:{symbol:'€',title:'欧元'}};
+if(!CURRENCY_META[displayCurrency])displayCurrency='CNY';
+const ICONS={spinner:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>',check:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>',back:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>',send:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',edit:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',refresh:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>'};
 const toastStack=document.createElement('div');toastStack.className='toast-stack';toastStack.setAttribute('aria-live','polite');document.body.appendChild(toastStack);
 function toast(message,type='success'){const el=document.createElement('div');el.className=`toast ${type==='error'?'error':''}`;el.innerHTML=`<span class="toast-icon">${type==='error'?'!':'✓'}</span><span>${escapeHtml(message)}</span>`;toastStack.appendChild(el);setTimeout(()=>{el.classList.add('out');setTimeout(()=>el.remove(),220)},2800)}
 function setBusy(button,busy,label){if(!button)return;if(busy){button.dataset.label=button.innerHTML;button.classList.add('busy');button.disabled=true;button.innerHTML=`${ICONS.spinner}${label||'处理中'}`}else{button.classList.remove('busy');button.disabled=false;button.innerHTML=button.dataset.label||label||button.innerHTML}}
@@ -774,21 +946,36 @@ themeButtons.forEach(b=>b.onclick=()=>setTheme(b.dataset.themeValue,true));setTh
 async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});if(r.status===401){showLogin();throw new Error('请先登录')}const t=await r.text();const data=t?JSON.parse(t):{};if(!r.ok)throw new Error(data.error||'请求失败');return data}
 function showLogin(){login.classList.remove('hidden');app.classList.add('hidden')}function showApp(){login.classList.add('hidden');app.classList.remove('hidden')}
 function daysLeft(d){if(!d)return '';return Math.ceil((new Date(d+'T00:00:00')-new Date())/86400000)}
+function effectiveExpiry(d){return d.whois?.expires_at||d.expires_at}
+function effectiveRegistrar(d){return d.registrar||d.whois?.registrar}
 function expiryText(d){const n=daysLeft(d);if(n==='')return '未填写';if(n<0)return `已过期 ${Math.abs(n)} 天`;if(n<=30)return `${d}（还剩 ${n} 天）`;return d}
-function statusInfo(d){const n=daysLeft(d);if(n==='')return ['unknown','未填写到期'];if(n<0)return ['danger','已过期'];if(n<=30)return ['danger','马上续费'];if(n<=90)return ['warn','需要关注'];return ['ok','状态正常']}
-function priceInfo(text){const raw=String(text||'');const match=raw.replace(/,/g,'').match(/\d+(?:\.\d+)?/);if(!match)return null;let symbol='';if(/usd|\$/i.test(raw))symbol='$';else if(/cny|rmb|¥|元/i.test(raw))symbol='¥';return {amount:Number(match[0]),symbol}}
-function remainingValue(d){const price=priceInfo(d.renewal_price),days=daysLeft(d.expires_at);if(!price||days===''||days<=0)return null;return {amount:price.amount*days/365,symbol:price.symbol}}
-function money(value,symbol=''){const fixed=value>=100?value.toFixed(0):value.toFixed(2);return symbol?`${symbol}${fixed}`:fixed}
-function totalRemaining(){const totals={};for(const d of domains){const v=remainingValue(d);if(v)totals[v.symbol]=(totals[v.symbol]||0)+v.amount}const parts=Object.entries(totals).map(([symbol,total])=>money(total,symbol));return parts.length?parts.join(' + '):'暂无可估算价值'}
-function renderOverview(){const expiring=domains.filter(d=>{const n=daysLeft(d.expires_at);return n!==''&&n>=0&&n<=90}).length;const expired=domains.filter(d=>{const n=daysLeft(d.expires_at);return n!==''&&n<0}).length;overview.innerHTML=`<section class="asset-band"><div class="metric-title"><h2>当前域名资产剩余价值</h2><span class="muted">按年费和剩余天数估算</span></div><div class="metric-value">${escapeHtml(totalRemaining())}</div><div class="metric-grid"><div class="mini-metric"><span class="label">域名总数</span><b>${domains.length}</b></div><div class="mini-metric"><span class="label">90 天内续费</span><b>${expiring}</b></div><div class="mini-metric"><span class="label">已过期</span><b>${expired}</b></div></div></section><section class="rank-section"><div class="rank-title"><h2>续费排名</h2><span class="muted">从近到远</span></div><div class="rank-list">${renderRank()}</div></section>`}
-function renderRank(){const sorted=[...domains].sort((a,b)=>{const da=daysLeft(a.expires_at),db=daysLeft(b.expires_at);return (da===''?Infinity:da)-(db===''?Infinity:db)}).slice(0,8);if(!sorted.length)return '<div class="empty">暂无域名</div>';return sorted.map((d,i)=>{const n=daysLeft(d.expires_at),cls=n!==''&&n<=30?'danger':n!==''&&n<=90?'warn':'';const dayText=n===''?'未填写':n<0?`过期 ${Math.abs(n)} 天`:`${n} 天`;return `<div class="rank-item"><span class="rank-index">${i+1}</span><div><div class="rank-name">${escapeHtml(d.name)}</div><div class="rank-meta">${escapeHtml(d.expires_at||'未填写到期时间')} · ${escapeHtml(d.renewal_price||'未填写续费价')}</div></div><strong class="rank-days ${cls}">${dayText}</strong></div>`}).join('')}
-async function loadDomains(){showApp();showList(false);overview.innerHTML='<div class="skeleton skeleton-band"></div><div class="skeleton skeleton-band"></div>';cards.innerHTML='<div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div>';try{const data=await api('/api/domains');domains=data.domains;renderList();enterView(listView)}catch(e){toast(e.message,'error')}}
+function statusInfo(d){if(d.whois?.healthy===false)return ['danger','状态异常'];const n=daysLeft(effectiveExpiry(d));if(n==='')return ['unknown','待查询'];if(n<0)return ['danger','已过期'];if(n<=30)return ['danger','马上续费'];if(n<=90)return ['warn','需要关注'];return ['ok',d.whois?'状态正常':'日期正常']}
+function priceInfo(text){const raw=String(text||''),match=raw.replace(/,/g,'').match(/\d+(?:\.\d+)?/);if(!match)return null;let currency='CNY';if(/jpy|日元/i.test(raw))currency='JPY';else if(/hkd|港币|港元/i.test(raw))currency='HKD';else if(/gbp|£|英镑/i.test(raw))currency='GBP';else if(/eur|€|欧元/i.test(raw))currency='EUR';else if(/usd|\$|美元/i.test(raw))currency='USD';return {amount:Number(match[0]),currency,period:/月|month/i.test(raw)?' / 月':' / 年'}}
+function convertedAmount(amount,from,to=displayCurrency){return amount/(exchangeRates[from]||1)*(exchangeRates[to]||1)}
+function money(value,currency=displayCurrency){const digits=currency==='JPY'?0:value>=100?0:2;return `${CURRENCY_META[currency]?.symbol||currency} ${Number(value).toLocaleString('zh-CN',{minimumFractionDigits:digits,maximumFractionDigits:digits})}`}
+function convertedPrice(text){const price=priceInfo(text);return price?`${money(convertedAmount(price.amount,price.currency))}${price.period}`:'未填写'}
+function remainingValue(d){const price=priceInfo(d.renewal_price),days=daysLeft(effectiveExpiry(d));if(!price||days===''||days<=0)return null;return convertedAmount(price.amount*days/365,price.currency)}
+function totalRemaining(){let total=0,found=false;for(const d of domains){const value=remainingValue(d);if(value!==null){total+=value;found=true}}return found?money(total):'暂无可估算价值'}
+function setCurrency(currency){if(!CURRENCY_META[currency])return;displayCurrency=currency;localStorage.setItem('dm_currency',currency);renderList()}
+function renderOverview(){const expiring=domains.filter(d=>{const n=daysLeft(effectiveExpiry(d));return n!==''&&n>=0&&n<=90}).length;const expired=domains.filter(d=>{const n=daysLeft(effectiveExpiry(d));return n!==''&&n<0}).length;const currencies=Object.entries(CURRENCY_META).map(([code,meta])=>`<button class="currency-option ${displayCurrency===code?'active':''}" data-currency="${code}" title="切换为${meta.title}" aria-label="切换为${meta.title}" aria-pressed="${displayCurrency===code}">${meta.symbol}</button>`).join('');overview.innerHTML=`<section class="asset-band"><div class="metric-title"><h2>当前域名资产剩余价值</h2><div class="currency-switch" role="group" aria-label="显示货币">${currencies}</div></div><div class="metric-value">${escapeHtml(totalRemaining())}</div><div class="metric-grid"><div class="mini-metric"><span class="label">域名总数</span><b>${domains.length}</b></div><div class="mini-metric"><span class="label">90 天内续费</span><b>${expiring}</b></div><div class="mini-metric"><span class="label">已过期</span><b>${expired}</b></div></div></section><section class="rank-section"><div class="rank-title"><h2>续费排名</h2><span class="muted">从近到远</span></div><div class="rank-list">${renderRank()}</div></section>`;overview.querySelectorAll('[data-currency]').forEach(button=>button.onclick=()=>setCurrency(button.dataset.currency))}
+function renderRank(){const sorted=[...domains].sort((a,b)=>{const da=daysLeft(effectiveExpiry(a)),db=daysLeft(effectiveExpiry(b));return (da===''?Infinity:da)-(db===''?Infinity:db)}).slice(0,8);if(!sorted.length)return '<div class="empty">暂无域名</div>';return sorted.map((d,i)=>{const expiry=effectiveExpiry(d),n=daysLeft(expiry),cls=n!==''&&n<=30?'danger':n!==''&&n<=90?'warn':'';const dayText=n===''?'未填写':n<0?`过期 ${Math.abs(n)} 天`:`${n} 天`;return `<div class="rank-item"><span class="rank-index">${i+1}</span><div><div class="rank-name">${escapeHtml(d.name)}</div><div class="rank-meta">${escapeHtml(expiry||'未填写到期时间')} · ${escapeHtml(convertedPrice(d.renewal_price))}</div></div><strong class="rank-days ${cls}">${dayText}</strong></div>`}).join('')}
+async function loadDomains(){showApp();showList(false);overview.innerHTML='<div class="skeleton skeleton-band"></div><div class="skeleton skeleton-band"></div>';cards.innerHTML='<div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div>';try{const data=await api('/api/domains');domains=data.domains;renderList();enterView(listView);refreshWhoisCards();loadExchangeRates()}catch(e){toast(e.message,'error')}}
+async function loadExchangeRates(){if(exchangeRatesLoaded)return;exchangeRatesLoaded=true;try{const data=await api('/api/exchange-rates');exchangeRates={...exchangeRates,...data.rates};if(!listView.classList.contains('hidden'))renderList()}catch(e){exchangeRatesLoaded=false}}
+function whoisStale(d){const checked=Date.parse(d.whois_checked_at||'');return !d.whois||!Number.isFinite(checked)||Date.now()-checked>86400000}
+async function refreshWhoisCards(){const pending=domains.filter(whoisStale);let index=0,changed=false;async function worker(){while(index<pending.length){const d=pending[index++];try{const data=await api(`/api/domains/${d.id}/whois`);d.whois=data.whois;d.whois_checked_at=data.whois.checked_at;changed=true}catch(e){}}}await Promise.all(Array.from({length:Math.min(3,pending.length)},worker));if(changed&&!listView.classList.contains('hidden'))renderList()}
 function showList(animate=true){settingsView.classList.add('hidden');detailView.classList.add('hidden');listView.classList.remove('hidden');activateNav('home');if(animate)enterView(listView)}
-function registrarMark(registrar){const raw=String(registrar||'').trim(),name=raw.toLowerCase();const known=[['cloudflare','cloudflare','☁'],['namecheap','namecheap','N'],['godaddy','godaddy','G'],['阿里','aliyun','A'],['aliyun','aliyun','A'],['alibaba','aliyun','A'],['腾讯','tencent','T'],['tencent','tencent','T'],['namesilo','namesilo','NS'],['porkbun','porkbun','P'],['dynadot','dynadot','D']];for(const [key,kind,label] of known)if(name.includes(key))return{kind,label};return{kind:'generic',label:raw?[...raw][0].toUpperCase():'◎'}}
-function renderList(){showList(false);renderOverview();let bar=document.getElementById('sectionBar');if(!bar){bar=document.createElement('div');bar.id='sectionBar';bar.className='section-bar';cards.before(bar)}bar.innerHTML=`<h2>域名资产</h2><span class="section-count">${domains.length} 个域名</span>`;cards.innerHTML='';if(!domains.length){cards.innerHTML='<div class="empty">还没有域名，点右上角新增。</div>';return}domains.forEach((d,i)=>{const [state,label]=statusInfo(d.expires_at);const remaining=remainingValue(d),mark=registrarMark(d.registrar);const b=document.createElement('button');b.className=`card ${state==='danger'?'danger':state==='warn'?'warn':''}`;b.style.setProperty('--i',i);b.innerHTML=`<div class="registrar-mark registrar-${mark.kind}" aria-hidden="true">${escapeHtml(mark.label)}</div><div class="card-top"><span class="domain">${escapeHtml(d.name)}</span><span class="status ${state==='danger'?'danger':state==='warn'?'warn':''}">${label}</span></div><div class="tag-line"><span class="tag">${escapeHtml(d.registrar||'未填写注册商')}</span>${d.auto_renew?'<span class="auto-badge">自动续费</span>':''}</div><div class="meta"><div class="row"><span class="label">到期时间</span><strong class="value">${escapeHtml(expiryText(d.expires_at))}</strong></div><div class="row"><span class="label">续费价格</span><strong class="value">${escapeHtml(d.renewal_price||'未填写')}</strong></div><div class="row"><span class="label">剩余价值</span><strong class="value">${escapeHtml(remaining?money(remaining.amount,remaining.symbol):'无法估算')}</strong></div></div>`;b.onclick=()=>openDetail(d.id);cards.appendChild(b)})}
+function brandSvg(title,color,path){return `<svg viewBox="0 0 24 24" role="img"><title>${title}</title><path fill="${color}" d="${path}"/></svg>`}
+const REGISTRAR_LOGOS={cloudflare:brandSvg('Cloudflare','#F38020','M16.5088 16.8447c.1475-.5068.0908-.9707-.1553-1.3154-.2246-.3164-.6045-.499-1.0615-.5205l-8.6592-.1123a.1559.1559 0 0 1-.1333-.0713c-.0283-.042-.0351-.0986-.021-.1553.0278-.084.1123-.1484.2036-.1562l8.7359-.1123c1.0351-.0489 2.1601-.8868 2.5537-1.9136l.499-1.3013c.0215-.0561.0293-.1128.0147-.168-.5625-2.5463-2.835-4.4453-5.5499-4.4453-2.5039 0-4.6284 1.6177-5.3876 3.8614-.4927-.3658-1.1187-.5625-1.794-.499-1.2026.119-2.1665 1.083-2.2861 2.2856-.0283.31-.0069.6128.0635.894C1.5683 13.171 0 14.7754 0 16.752c0 .1748.0142.3515.0352.5273.0141.083.0844.1475.1689.1475h15.9814c.0909 0 .1758-.0645.2032-.1553l.12-.4268zm2.7568-5.5634c-.0771 0-.1611 0-.2383.0112-.0566 0-.1054.0415-.127.0976l-.3378 1.1744c-.1475.5068-.0918.9707.1543 1.3164.2256.3164.6055.498 1.0625.5195l1.8437.1133c.0557 0 .1055.0263.1329.0703.0283.043.0351.1074.0214.1562-.0283.084-.1132.1485-.204.1553l-1.921.1123c-1.041.0488-2.1582.8867-2.5527 1.914l-.1406.3585c-.0283.0713.0215.1416.0986.1416h6.5977c.0771 0 .1474-.0489.169-.126.1122-.4082.1757-.837.1757-1.2803 0-2.6025-2.125-4.727-4.7344-4.727'),spaceship:brandSvg('Spaceship','#394EFF','M11.9997 1.2529c1.0445 0 1.956.5689 2.441 1.4125l4.5883 7.9314 4.45 7.6915c.0466.074.2105.3585.27.4938.2216.4677.2505.9472.251 1.1595 0 1.5496-1.2587 2.8056-2.8116 2.8056-.2949 0-.579-.045-.8457-.129l-7.9011-2.6061a1.406 1.406 0 0 0-.4413-.0705 1.413 1.413 0 0 0-.442.0705L3.658 22.6183l-.1623.0456a2.8398 2.8398 0 0 1-.6838.0831c-1.5531 0-2.8119-1.256-2.8119-2.8056.002-.243.0234-.5533.168-.9578.0294-.0911.0743-.176.1115-.264.0712-.1487.1607-.2875.2411-.4313l4.4493-7.6916 4.5883-7.9313c.485-.8437 1.3971-1.4126 2.4416-1.4126z'),aliyun:brandSvg('Alibaba Cloud','#FF6A00','M3.996 4.517h5.291L8.01 6.324 4.153 7.506a1.668 1.668 0 0 0-1.165 1.601v5.786a1.668 1.668 0 0 0 1.165 1.6l3.857 1.183 1.277 1.807H3.996A3.996 3.996 0 0 1 0 15.487V8.513a3.996 3.996 0 0 1 3.996-3.996m16.008 0h-5.291l1.277 1.807 3.857 1.182c.715.227 1.17.889 1.165 1.601v5.786a1.668 1.668 0 0 1-1.165 1.6l-3.857 1.183-1.277 1.807h5.291A3.996 3.996 0 0 0 24 15.487V8.513a3.996 3.996 0 0 0-3.996-3.996m-4.007 8.345H8.002v-1.804h7.995Z'),namecheap:brandSvg('Namecheap','#DE3723','M17.295 17.484c.227.403.57.728.985.931-.309.15-.647.229-.99.232h-3.068a2.26 2.26 0 0 1-1.957-1.143L6.705 6.511a2.27 2.27 0 0 0-.974-.922c.309-.153.652-.233.997-.232h3.05c.81.003 1.558.438 1.959 1.143l5.558 10.984zm-9.329-7.392L6.269 6.755c-.209-.392-.582-.657-.984-.829-.204.165-.391.35-.522.581-.184.349-4.391 8.648-4.569 8.987a2.245 2.245 0 0 0 4.016 1.999l3.756-7.401zm15.846-1.593a2.245 2.245 0 0 0-1.162-2.955v-.001a2.243 2.243 0 0 0-.892-.187l-.003-.011c-.816 0-1.569.443-1.965 1.157l-3.749 7.414 1.689 3.323c.213.399.59.664.998.839.252-.2.473-.444.605-.742l4.479-8.837z'),godaddy:brandSvg('GoDaddy','#00A4A6','M20.702 2.29c-2.494-1.554-5.778-1.187-8.706.654C9.076 1.104 5.79.736 3.3 2.29c-3.941 2.463-4.42 8.806-1.07 14.167 2.47 3.954 6.333 6.269 9.77 6.226 3.439.043 7.301-2.273 9.771-6.226 3.347-5.361 2.872-11.704-1.069-14.167zM4.042 15.328a12.838 12.838 0 01-1.546-3.541 10.12 10.12 0 01-.336-3.338c.15-1.98.956-3.524 2.27-4.345 1.315-.822 3.052-.87 4.903-.137.281.113.556.24.825.382A15.11 15.11 0 007.5 7.54c-2.035 3.255-2.655 6.878-1.945 9.765a13.247 13.247 0 01-1.514-1.98zm17.465-3.541a12.866 12.866 0 01-1.547 3.54 13.25 13.25 0 01-1.513 1.984c.635-2.589.203-5.76-1.353-8.734a.39.39 0 00-.563-.153l-4.852 3.032a.397.397 0 00-.126.546l.712 1.139a.395.395 0 00.547.126l3.145-1.965c.101.306.203.606.28.916.296 1.086.41 2.214.335 3.337-.15 1.982-.956 3.525-2.27 4.347a4.437 4.437 0 01-2.25.65h-.101a4.432 4.432 0 01-2.25-.65c-1.314-.822-2.121-2.365-2.27-4.347-.074-1.123.039-2.251.335-3.337a13.212 13.212 0 014.05-6.482 10.148 10.148 0 012.849-1.765c1.845-.733 3.586-.685 4.9.137 1.316.822 2.122 2.365 2.271 4.345a10.146 10.146 0 01-.33 3.334z'),tencent:`<img alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAAAYFBMVEX///8Ao/4AyNwAbv8Ao/8Abv8Ao/8Ao/sAyNwAx9wAyNwAbv8Ao/8Ao/8Ao/8Abv8AyNwAyNwAbv8AyNwAbv8Ao/8Abv8AtuMAAAAAAAAAAAAAAAAAAACKEm3YAAAAIHRSTlMA+/z7Dwkvzg7QLJ1NsGxoUGvWsVuDrYPOO4UAAAAAAIZKY6EAAADpSURBVHja1ZDbgoMgDERj5WYqqNjq7v7/h24S8I7v7bwoOZMhAeCzpLupJk2dLvNXvaortT/rnZ7XEOaRw3UX2VHKX9ok7HW64NAkDn0J2FV0jPH3YJhOk59mxNnanz+3FVTw1r9NPrnxkTRni3pXSV4Jbx6LRnEoXy2yKvOxx56/DRK3TFrT+uToqd5L0sCOxINkt/TXAg0w52HIi4nnAs3igdrW8RGNla5lGTqwYVvPVHsOkA3ujksCDT/ccAi0BvDsuHEDxwsDOH6hwV25ClygfTG9YlOVJA3Y3HGbA90wlrhP7/kN+gdFkQhWm+JcdQAAAABJRU5ErkJggg==">`,regery:`<img alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAAAYFBMVEVZktw+gNc0drxOgLGAgIBGdLk3gMgzgL8A//+hv+gAAP/8/PwAAAAweNetx+vJ2fCTt+dKiNo4fNTm7PQzedIzdsgudc53peLZ5PODrOU0dsdclN0vdtEudMy80e1lmd1HTxt6AAAAIHRSTlPu6BIIAgsOFAH/Af8A/v////fM/68rcP7//xj6jlP/+lhqgL4AAAFsSURBVHjabZPXlsMgDERlJ1tJKKKZZv//Xy5gcN15wvgeDYwEvDZ9aqMQUUWjP/Zd6AtvlLCczpRyK1QaL8CHQUslaZIUMD2OgFdhJidREf0OaHSSXDRZ5TugkZOJHsSqz0pkYFQuf8J71xBoJeKjAmYp9Zl4H8WLS0gF0FArEn4C3qUGRZ+B6NrdeFcogChlwbzAtwIHSVuIsk3VCGkhN02ieUiRQPE7IEU7JrEGkN4B1k9JuIKB3f+XU4qpJo6wLrp4WCCIHkRmr8AWF8gNOFvQ+lvw1rxsgZc+271+DeJ2zZrB5usimBYU622uJrYFEhL0Xrm8HWRfrSmQGUd4Rr4BtUHNhK1Blnav6x1YTaAUGHQGvqO9AHU0BkrkYupE+XqRaZ7nHolkWRNx6tGH9of8I456H/t7z6Wr/9vD0eo6V2xR+vj0voxwB4RZMP78eJ86wsJpOR3lYTD69rpfT58ivoVAjGn83bb/ANw9NvipnpdLAAAAAElFTkSuQmCC">`};
+function registrarMark(registrar){const raw=String(registrar||'').trim(),name=raw.toLowerCase();const known=[['cloudflare','cloudflare'],['spaceship','spaceship'],['regery','regery'],['namecheap','namecheap'],['godaddy','godaddy'],['阿里','aliyun'],['aliyun','aliyun'],['alibaba','aliyun'],['腾讯','tencent'],['tencent','tencent']];if(name==='cf')return{kind:'cloudflare',html:REGISTRAR_LOGOS.cloudflare};for(const [key,kind] of known)if(name.includes(key))return{kind,html:REGISTRAR_LOGOS[kind]};return{kind:'generic',html:`<span>${escapeHtml(raw?[...raw][0].toUpperCase():'◎')}</span>`}}
+function renderList(){showList(false);renderOverview();let bar=document.getElementById('sectionBar');if(!bar){bar=document.createElement('div');bar.id='sectionBar';bar.className='section-bar';cards.before(bar)}bar.innerHTML=`<h2>域名资产</h2><span class="section-count">${domains.length} 个域名</span>`;cards.innerHTML='';if(!domains.length){cards.innerHTML='<div class="empty">还没有域名，点右上角新增。</div>';return}domains.forEach((d,i)=>{const [state,label]=statusInfo(d),registrar=effectiveRegistrar(d),expiry=effectiveExpiry(d);const remaining=remainingValue(d),mark=registrarMark(registrar);const b=document.createElement('button');b.className=`card ${state==='danger'?'danger':state==='warn'?'warn':''}`;b.style.setProperty('--i',i);b.innerHTML=`<div class="registrar-mark registrar-${mark.kind}" aria-hidden="true">${mark.html}</div><div class="card-top"><span class="domain">${escapeHtml(d.name)}</span><span class="status ${state==='danger'?'danger':state==='warn'?'warn':''}">${label}</span></div><div class="tag-line"><span class="tag">${escapeHtml(registrar||'未填写注册商')}</span>${d.auto_renew?'<span class="auto-badge">自动续费</span>':''}</div><div class="meta"><div class="row"><span class="label">到期时间</span><strong class="value">${escapeHtml(expiryText(expiry))}</strong></div><div class="row"><span class="label">续费价格</span><strong class="value" title="原价：${escapeAttr(d.renewal_price||'未填写')}">${escapeHtml(convertedPrice(d.renewal_price))}</strong></div><div class="row"><span class="label">剩余价值</span><strong class="value">${escapeHtml(remaining===null?'无法估算':money(remaining))}</strong></div></div>`;b.onclick=()=>openDetail(d.id);cards.appendChild(b)})}
 function blank(){return{id:null,name:'',expires_at:'',registrar:'',renewal_price:'',renewal_url:'',auto_renew:false,notes:''}}
-function openDetail(id){current=id?domains.find(d=>d.id===id):blank();settingsView.classList.add('hidden');listView.classList.add('hidden');detailView.classList.remove('hidden');activateNav('home');renderDetail();enterView(detailView)}
-function renderDetail(){const d=current;detailView.innerHTML=`<div class="toolbar"><div><div class="page-kicker">${d.id?'Asset detail':'New asset'}</div><h1>${d.id?escapeHtml(d.name):'新增域名'}</h1></div><div class="detail-actions"><button class="btn" id="backBtn">${ICONS.back}返回</button><button class="btn danger ${d.id?'':'hidden'}" id="deleteBtn">删除</button><a class="btn ${d.renewal_url?'':'hidden'}" href="${escapeAttr(d.renewal_url)}" target="_blank" rel="noopener">去续费</a><button class="btn primary" id="saveBtn">保存</button></div></div><div class="detail"><section class="panel"><h2>域名信息</h2><div class="form form-grid"><label class="field"><span>域名</span><input id="fName" value="${escapeAttr(d.name)}" placeholder="example.com"></label><label class="field"><span>到期时间</span><input id="fExpires" type="date" value="${escapeAttr(d.expires_at||'')}"></label><label class="field"><span>注册商</span><input id="fRegistrar" value="${escapeAttr(d.registrar||'')}" placeholder="阿里云 / Cloudflare / Namecheap"></label><label class="field"><span>续费价格</span><input id="fPrice" value="${escapeAttr(d.renewal_price||'')}" placeholder="例如 69 元 / 年"></label><label class="field wide"><span>续费链接</span><input id="fUrl" value="${escapeAttr(d.renewal_url||'')}" placeholder="https://..."></label><label class="switch-row wide"><span class="switch-copy"><b>注册商已开启自动续费</b><small>到期后面板自动顺延 1 年，不会代替注册商扣费；临近到期仍会照常提醒。</small></span><input id="fAutoRenew" type="checkbox" ${d.auto_renew?'checked':''}><span class="switch-track"></span></label><label class="field wide"><span>备注</span><textarea id="fNotes">${escapeHtml(d.notes||'')}</textarea></label></div></section></div>`;backBtn.onclick=loadDomains;saveBtn.onclick=saveCurrent;if(d.id)deleteBtn.onclick=deleteCurrent}
+function problemWhoisStatus(status){return ['redemptionperiod','pendingdelete','serverhold','clienthold','inactive'].includes(String(status).toLowerCase().replace(/[^a-z]/g,''))}
+function archiveBody(d,loading,error){const w=d.whois;if(!w)return `<div class="archive-note ${error?'error':''}">${loading?'正在查询注册局 WHOIS 档案…':escapeHtml(error||'暂时没有可用的 WHOIS 档案，点击右上角重新查询。')}</div>`;const statuses=w.statuses?.length?w.statuses.map(s=>`<span class="status-chip ${problemWhoisStatus(s)?'danger':''}">${escapeHtml(s)}</span>`).join(''):'<span class="muted">注册局未返回状态</span>';const nameservers=w.nameservers?.length?w.nameservers.map(s=>`<span class="nameserver-chip">${escapeHtml(s)}</span>`).join(''):'<span class="muted">注册局未返回 Nameserver</span>';return `<div class="record-grid"><dl class="record"><dt>创建时间</dt><dd>${escapeHtml(w.created_at||'暂无数据')}</dd></dl><dl class="record"><dt>真实到期时间</dt><dd>${escapeHtml(w.expires_at||'暂无数据')}</dd></dl><dl class="record"><dt>最后更新</dt><dd>${escapeHtml(w.updated_at||'暂无数据')}</dd></dl><dl class="record"><dt>注册商</dt><dd>${escapeHtml(effectiveRegistrar(d)||'暂无数据')}</dd></dl><dl class="record"><dt>续费价格</dt><dd title="原价：${escapeAttr(d.renewal_price||'未填写')}">${escapeHtml(convertedPrice(d.renewal_price))}</dd></dl><dl class="record"><dt>DNSSEC</dt><dd>${w.secure_dns?'已签名':'未签名或未知'}</dd></dl><dl class="record"><dt>自动续费</dt><dd>${d.auto_renew?'已开启':'未开启'}</dd></dl></div><div class="archive-section"><h3>域名状态</h3><div class="status-list">${statuses}</div></div><div class="archive-section"><h3>Nameserver</h3><div class="nameserver-list">${nameservers}</div></div><div class="archive-section"><h3>资产备注</h3><div class="archive-note">${escapeHtml(d.notes||'暂无备注')}</div></div><div class="archive-foot">查询时间：${escapeHtml(w.checked_at?new Date(w.checked_at).toLocaleString():'未知')} · 数据源：RDAP / 注册局公开档案</div>`}
+function openDetail(id){current=domains.find(d=>d.id===id);if(!current)return loadDomains();settingsView.classList.add('hidden');listView.classList.add('hidden');detailView.classList.remove('hidden');activateNav('home');renderDetail(!current.whois);enterView(detailView);loadWhois(false)}
+function renderDetail(loading=false,error=''){const d=current,[state,label]=statusInfo(d);detailView.innerHTML=`<div class="toolbar"><div><div class="page-kicker">Asset detail</div><h1>${escapeHtml(d.name)}</h1><span class="status ${state==='danger'?'danger':state==='warn'?'warn':''}">${label}</span></div><div class="detail-actions"><button class="btn" id="backBtn">${ICONS.back}返回</button><a class="btn ${d.renewal_url?'':'hidden'}" href="${escapeAttr(d.renewal_url)}" target="_blank" rel="noopener">去续费</a><button class="btn primary" id="editBtn">${ICONS.edit}编辑</button></div></div><div class="detail"><section class="panel"><div class="archive-head"><div><h2>WHOIS 资产档案</h2><p>来自注册局的公开 RDAP 数据，用于判断域名真实状态。</p></div><button class="btn" id="refreshWhoisBtn">${ICONS.refresh}刷新档案</button></div>${archiveBody(d,loading,error)}</section></div>`;backBtn.onclick=loadDomains;editBtn.onclick=()=>openEdit(d.id);refreshWhoisBtn.onclick=()=>loadWhois(true)}
+async function loadWhois(refresh){const id=current.id,button=$('#refreshWhoisBtn');if(refresh)setBusy(button,true,'查询中');try{const data=await api(`/api/domains/${id}/whois${refresh?'?refresh=1':''}`);if(current?.id!==id)return;current.whois=data.whois;current.whois_checked_at=data.whois.checked_at;const listed=domains.find(d=>d.id===id);if(listed)Object.assign(listed,{whois:data.whois,whois_checked_at:data.whois.checked_at});renderDetail();if(data.warning)toast(data.warning,'error')}catch(e){if(current?.id===id)renderDetail(false,e.message)}}
+function openEdit(id){current=id===null?blank():(domains.find(d=>d.id===id)||current);settingsView.classList.add('hidden');listView.classList.add('hidden');detailView.classList.remove('hidden');activateNav('home');renderEdit();enterView(detailView)}
+function renderEdit(){const d=current,autoRegistrar=d.whois?.registrar||'';detailView.innerHTML=`<div class="toolbar"><div><div class="page-kicker">${d.id?'Edit asset':'New asset'}</div><h1>${d.id?escapeHtml(d.name):'新增域名'}</h1></div><div class="detail-actions"><button class="btn" id="backBtn">${ICONS.back}${d.id?'返回详情':'返回'}</button><button class="btn danger ${d.id?'':'hidden'}" id="deleteBtn">删除</button><a class="btn ${d.renewal_url?'':'hidden'}" href="${escapeAttr(d.renewal_url)}" target="_blank" rel="noopener">去续费</a><button class="btn primary" id="saveBtn">保存</button></div></div><div class="detail"><section class="panel"><h2>域名信息</h2><div class="form form-grid"><label class="field"><span>域名</span><input id="fName" value="${escapeAttr(d.name)}" placeholder="example.com"></label><label class="field"><span>到期时间</span><input id="fExpires" type="date" value="${escapeAttr(d.expires_at||'')}"></label><label class="field"><span>注册商（留空则自动获取）</span><input id="fRegistrar" value="${escapeAttr(d.registrar||'')}" placeholder="${escapeAttr(autoRegistrar?`自动：${autoRegistrar}`:'保存后自动获取')}"></label><label class="field"><span>续费价格</span><input id="fPrice" value="${escapeAttr(d.renewal_price||'')}" placeholder="例如 69 元 / 年"></label><label class="field wide"><span>续费链接</span><input id="fUrl" value="${escapeAttr(d.renewal_url||'')}" placeholder="https://..."></label><label class="switch-row wide"><span class="switch-copy"><b>注册商已开启自动续费</b><small>到期后面板自动顺延 1 年，不会代替注册商扣费；临近到期仍会照常提醒。</small></span><input id="fAutoRenew" type="checkbox" ${d.auto_renew?'checked':''}><span class="switch-track"></span></label><label class="field wide"><span>备注</span><textarea id="fNotes">${escapeHtml(d.notes||'')}</textarea></label></div></section></div>`;backBtn.onclick=d.id?()=>openDetail(d.id):loadDomains;saveBtn.onclick=saveCurrent;if(d.id)deleteBtn.onclick=deleteCurrent}
 function collect(){return{name:fName.value,expires_at:fExpires.value,registrar:fRegistrar.value,renewal_price:fPrice.value,renewal_url:fUrl.value,auto_renew:fAutoRenew.checked,notes:fNotes.value}}
 async function openSettings(){showApp();listView.classList.add('hidden');detailView.classList.add('hidden');settingsView.classList.remove('hidden');activateNav('settings');settingsView.innerHTML='<div class="skeleton skeleton-band"></div><div class="settings-layout"><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div></div>';try{const data=await api('/api/settings');settings=data.settings;renderSettings();addEmailTestButton();enterView(settingsView);await loadEmailPreview()}catch(e){toast(e.message,'error')}}
 function renderSettings(){const s=settings;settingsView.innerHTML=`<div class="toolbar"><div><div class="page-kicker">Notifications</div><h1>通知设置</h1><div class="muted">管理域名到期提醒渠道。</div></div><button class="btn primary" id="saveSettingsBtn">保存设置</button></div><div class="settings-layout"><section class="panel settings-panel"><div class="settings-tabs" role="tablist"><button class="settings-tab" data-settings-tab="rules">提醒规则</button><button class="settings-tab" data-settings-tab="telegram">Telegram</button><button class="settings-tab" data-settings-tab="email">邮件</button></div><div class="settings-pane" data-settings-pane="rules"><label class="switch-row"><span>启用到期提醒</span><input id="nEnabled" type="checkbox" ${s.notify_enabled?'checked':''}><span class="switch-track"></span></label><div class="form" style="margin-top:18px"><label class="field"><span>提前提醒天数</span><input id="nDays" value="${escapeAttr(s.reminder_days||'30,7,1')}" placeholder="例如 30,7,1"></label></div></div><div class="settings-pane" data-settings-pane="telegram" hidden><label class="switch-row"><span>启用 TG 机器人通知</span><input id="tgEnabled" type="checkbox" ${s.telegram_enabled?'checked':''}><span class="switch-track"></span></label><div class="form" style="margin-top:18px"><label class="field"><span>Bot Token${s.telegram_bot_configured?'（已保存，留空不修改）':''}</span><input id="tgToken" type="password" autocomplete="new-password" placeholder="123456:ABC..."></label><label class="field"><span>Chat ID</span><input id="tgChat" value="${escapeAttr(s.telegram_chat_id||'')}" placeholder="个人或群组 Chat ID"></label></div></div><div class="settings-pane" data-settings-pane="email" hidden><label class="switch-row"><span>启用邮件通知</span><input id="mailEnabled" type="checkbox" ${s.email_enabled?'checked':''}><span class="switch-track"></span></label><div class="form-grid" style="margin-top:18px"><label class="field wide"><span>SMTP 主机</span><input id="smtpHost" value="${escapeAttr(s.smtp_host||'')}" placeholder="smtp.example.com"></label><label class="field"><span>SMTP 端口</span><input id="smtpPort" type="number" min="1" max="65535" value="${escapeAttr(s.smtp_port||465)}"></label><label class="field"><span>连接方式</span><select id="smtpSecurity"><option value="ssl" ${s.smtp_security==='ssl'?'selected':''}>SSL</option><option value="starttls" ${s.smtp_security==='starttls'?'selected':''}>STARTTLS</option><option value="none" ${s.smtp_security==='none'?'selected':''}>不加密</option></select></label><label class="field wide"><span>SMTP 用户名</span><input id="smtpUser" value="${escapeAttr(s.smtp_username||'')}" autocomplete="username"></label><label class="field wide"><span>SMTP 密码${s.smtp_password_configured?'（已保存，留空不修改）':''}</span><input id="smtpPass" type="password" autocomplete="new-password"></label><label class="field"><span>发件人</span><input id="mailFrom" value="${escapeAttr(s.mail_from||'')}" placeholder="notice@example.com"></label><label class="field"><span>收件人</span><input id="mailTo" value="${escapeAttr(s.mail_to||'')}" placeholder="you@example.com"></label></div></div></section><section class="panel preview-panel"><div class="preview-head"><h2>邮件预览</h2><span id="previewStatus" class="preview-status">加载中</span></div><iframe id="emailPreview" class="preview-frame loading" title="邮件预览"></iframe></section></div>`;document.querySelectorAll('[data-settings-tab]').forEach(button=>button.onclick=()=>{settingsTab=button.dataset.settingsTab;applySettingsTab()});saveSettingsBtn.onclick=saveSettings;settingsView.oninput=()=>saveSettingsBtn.classList.add('dirty');applySettingsTab()}
@@ -802,7 +989,7 @@ async function saveCurrent(){const button=saveBtn;setBusy(button,true,'保存中
 async function deleteCurrent(){if(!confirm('确定删除这个域名？'))return;const button=deleteBtn;setBusy(button,true,'删除中');try{await api(`/api/domains/${current.id}`,{method:'DELETE'});await loadDomains();toast('域名已删除')}catch(e){toast(e.message,'error');setBusy(button,false)}}
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function escapeAttr(s){return escapeHtml(s)}
 const localConnection=['localhost','127.0.0.1','::1'].includes(location.hostname);if(location.protocol==='https:')loginTransportText.textContent='当前连接已启用 HTTPS';else{loginTransport.classList.add('insecure');loginTransportText.textContent=localConnection?'当前为本地 HTTP 连接':'当前连接未启用 HTTPS'}
-loginForm.onsubmit=async e=>{e.preventDefault();const button=loginForm.querySelector('button[type=submit]');loginMsg.textContent='';setBusy(button,true,'登录中');try{await api('/api/login',{method:'POST',body:JSON.stringify({username:username.value,password:password.value})});await loadDomains();toast('登录成功')}catch(err){loginMsg.textContent=err.message}finally{setBusy(button,false)}};logoutBtn.onclick=async()=>{await api('/api/logout',{method:'POST'}).catch(()=>{});showLogin()};homeBtn.onclick=loadDomains;settingsBtn.onclick=openSettings;addBtn.onclick=()=>openDetail(null);
+loginForm.onsubmit=async e=>{e.preventDefault();const button=loginForm.querySelector('button[type=submit]');loginMsg.textContent='';setBusy(button,true,'登录中');try{await api('/api/login',{method:'POST',body:JSON.stringify({username:username.value,password:password.value})});await loadDomains();toast('登录成功')}catch(err){loginMsg.textContent=err.message}finally{setBusy(button,false)}};logoutBtn.onclick=async()=>{await api('/api/logout',{method:'POST'}).catch(()=>{});showLogin()};homeBtn.onclick=loadDomains;settingsBtn.onclick=openSettings;addBtn.onclick=()=>openEdit(null);
 (async()=>{const me=await api('/api/me').catch(()=>({user:null}));me.user?loadDomains():showLogin()})();
 </script>
 </body></html>"""

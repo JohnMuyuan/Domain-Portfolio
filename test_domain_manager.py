@@ -16,6 +16,43 @@ def test_domain_validation():
     assert domain["name"] == "example.com"
 
 
+def test_rdap_normalization_extracts_asset_record():
+    payload = {
+        "events": [
+            {"eventAction": "registration", "eventDate": "2020-01-02T03:04:05Z"},
+            {"eventAction": "expiration", "eventDate": "2027-01-02T00:00:00Z"},
+            {"eventAction": "last changed", "eventDate": "2026-06-01T00:00:00Z"},
+        ],
+        "status": ["client transfer prohibited", "server hold"],
+        "entities": [{
+            "roles": ["registrar"],
+            "handle": "fallback",
+            "vcardArray": ["vcard", [["fn", {}, "text", "Cloudflare, Inc."]]],
+        }],
+        "nameservers": [{"ldhName": "NS2.EXAMPLE.COM"}, {"ldhName": "NS1.EXAMPLE.COM"}],
+        "secureDNS": {"delegationSigned": True},
+    }
+
+    record = domain_manager.normalize_rdap(payload)
+
+    assert record["created_at"] == "2020-01-02"
+    assert record["expires_at"] == "2027-01-02"
+    assert record["updated_at"] == "2026-06-01"
+    assert record["registrar"] == "Cloudflare, Inc."
+    assert record["nameservers"] == ["ns1.example.com", "ns2.example.com"]
+    assert record["secure_dns"] is True
+    assert record["healthy"] is False
+
+
+def test_exchange_rates_are_normalized_with_fallbacks():
+    rates = domain_manager.normalize_exchange_rates({"rates": {"CNY": 7.25, "EUR": "0.84", "JPY": -1}})
+
+    assert rates["USD"] == 1
+    assert rates["CNY"] == 7.25
+    assert rates["EUR"] == 0.84
+    assert rates["JPY"] == domain_manager.FALLBACK_EXCHANGE_RATES["JPY"]
+
+
 def test_init_writes_config_and_sample_domain():
     class Args:
         username = "admin"

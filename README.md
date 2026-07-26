@@ -48,6 +48,8 @@ sudo sh install.sh
 
 默认监听 `127.0.0.1:8099`，推荐用 1Panel/Nginx 创建反向代理，并在 1Panel/Nginx 里启用 HTTPS。
 
+安装时面板密码留空会自动生成随机强密码，并在安装完成后显示。非交互安装不设置 `DM_PANEL_PASSWORD` 时也会自动生成。
+
 非交互安装示例：
 
 ```bash
