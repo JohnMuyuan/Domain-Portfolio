@@ -89,3 +89,20 @@ def test_email_sender_uses_test_subject():
 
     assert sent[0]["Subject"] == "域名管理器测试邮件"
     assert sent[0]["To"] == "owner@example.com"
+
+
+def test_auto_renewals_advance_only_enabled_domains():
+    domains = [
+        {"name": "due.test", "expires_at": "2026-07-26", "auto_renew": True},
+        {"name": "old.test", "expires_at": "2020-01-01", "auto_renew": True},
+        {"name": "leap.test", "expires_at": "2024-02-29", "auto_renew": True},
+        {"name": "manual.test", "expires_at": "2026-07-26", "auto_renew": False},
+    ]
+
+    changed = domain_manager.advance_auto_renewals(domains, domain_manager.date(2026, 7, 26))
+
+    assert changed == 3
+    assert domains[0]["expires_at"] == "2027-07-26"
+    assert domains[1]["expires_at"] == "2027-01-01"
+    assert domains[2]["expires_at"] == "2027-02-28"
+    assert domains[3]["expires_at"] == "2026-07-26"
