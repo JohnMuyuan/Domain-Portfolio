@@ -1,67 +1,56 @@
-# 域名管理器
+# Domain Manager
 
-一个小白向的域名资产展示和续费提醒面板：前端卡片展示域名，后端用 Python 标准库提供 API，数据保存在本地 JSON 文件里。
+A beginner-friendly domain portfolio and renewal reminder dashboard. Domain cards are displayed in the frontend, a Python standard-library backend serves the API, and data is stored in local JSON files.
 
-## 功能
+## Features
 
-- 首页用卡片列出所有域名。
-- 卡片显示到期时间、注册商、续费价格。
-- 根据续费年费和剩余天数估算域名资产剩余价值。
-- 按到期时间从近到远显示续费排名。
-- 点击卡片进入详情页。
-- 详情页可编辑域名信息、续费链接和资产备注。
-- 详情页可打开续费链接。
-- 支持日间、夜间和跟随系统主题。
-- 支持 Telegram 和邮件到期提醒、自定义提前提醒天数。
-- 设置页支持邮件预览和 SMTP 测试邮件。
-- 带登录页，适合放到 1Panel/Nginx 后面反向代理。
+- Domain cards with expiry dates, registrars, and renewal prices.
+- Remaining portfolio value estimated from annual renewal fees and days remaining.
+- Renewal ranking ordered by expiry date.
+- Detail pages for editing domain information, renewal links, and portfolio notes, and opening renewal links.
+- Light, dark, and system themes.
+- Telegram and email expiry reminders with configurable lead time.
+- Email previews and SMTP test emails in Settings.
+- A login page suitable for deployment behind a 1Panel or Nginx reverse proxy.
 
-说明：当前版本专注域名续费提醒和域名资产展示，不做 DNS 修改。
+The current version focuses on portfolio display and renewal reminders; it does not modify DNS records.
 
-## 本地运行
+## Run locally
 
 ```bash
-python3 domain_manager.py --data-dir ./data init --username admin --password '请换成强密码' --host 127.0.0.1 --port 8099 --no-tls
+python3 domain_manager.py --data-dir ./data init --username admin --password 'replace-with-a-strong-password' --host 127.0.0.1 --port 8099 --no-tls
 python3 domain_manager.py --data-dir ./data serve
 ```
 
-访问：
+Open `http://127.0.0.1:8099`.
 
-```text
-http://127.0.0.1:8099
-```
+## Deploy
 
-## 一键部署
-
-在 Linux 服务器执行：
+Run on a Linux server:
 
 ```bash
 curl -fLsS https://raw.githubusercontent.com/JohnMuyuan/Domain-Portfolio/main/install.sh -o install.sh
 sudo sh install.sh
 ```
 
-已经下载项目源码时，也可以进入项目目录后执行：
+If you have already downloaded the source, run `sudo sh install.sh` from the project directory.
 
-```bash
-sudo sh install.sh
-```
+The default listener is `127.0.0.1:8099`. Configure a reverse proxy and HTTPS in 1Panel or Nginx.
 
-默认监听 `127.0.0.1:8099`，推荐用 1Panel/Nginx 创建反向代理，并在 1Panel/Nginx 里启用 HTTPS。
+Leaving the dashboard password blank generates a strong random password, displayed after installation. Noninteractive installation also generates one when `DM_PANEL_PASSWORD` is unset.
 
-安装时面板密码留空会自动生成随机强密码，并在安装完成后显示。非交互安装不设置 `DM_PANEL_PASSWORD` 时也会自动生成。
-
-非交互安装示例：
+Noninteractive example:
 
 ```bash
 DM_NONINTERACTIVE=1 \
 DM_PANEL_USER=admin \
-DM_PANEL_PASSWORD='请换成强密码' \
+DM_PANEL_PASSWORD='replace-with-a-strong-password' \
 DM_PANEL_PORT=8099 \
 DM_REVERSE_PROXY=1 \
 sudo sh install.sh
 ```
 
-安装后管理命令：
+Management commands:
 
 ```bash
 domain-manager info
@@ -71,13 +60,13 @@ domain-manager logs
 domain-manager update
 ```
 
-## 数据位置
+## Data locations
 
-- 程序目录：`/opt/domain-manager`
-- 数据目录：`/var/lib/domain-manager`
-- 管理命令：`/usr/local/bin/domain-manager`
+- Application: `/opt/domain-manager`
+- Data: `/var/lib/domain-manager`
+- Management command: `/usr/local/bin/domain-manager`
 
-## 自检
+## Self-test
 
 ```bash
 python3 domain_manager.py --data-dir ./data self-test
